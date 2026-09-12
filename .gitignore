@@ -1,0 +1,10 @@
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
+.venv/
+.env
+.env.*
+report.md
+*.report.md
+!examples/report.example.md
