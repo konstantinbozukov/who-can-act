@@ -13,20 +13,55 @@ import sys
 from pathlib import Path
 
 SECRET_VAL = re.compile(
-    r"(?i)(sk-[a-z0-9]+|ghp_[a-z0-9]+|xox[baprs]-[a-z0-9-]+|bearer\s+\S+|AIza[0-9A-Za-z_-]{20,})"
+    r"(?i)("
+    r"sk-[a-z0-9_-]+|"
+    r"ghp_[a-z0-9]+|"
+    r"gho_[a-z0-9]+|"
+    r"github_pat_[a-zA-Z0-9_]+|"
+    r"xox[baprs]-[a-zA-Z0-9-]+|"
+    r"AIza[0-9A-Za-z_-]{20,}|"
+    r"AKIA[0-9A-Z]{16}|"
+    r"bearer\s+\S+"
+    r")"
 )
+QUERY_SECRET = re.compile(
+    r"(?i)([?&](?:api_key|token|key|secret|password|access_token)=)[^&\s\"']+"
+)
+
+
 def redact(value: object) -> str:
     text = str(value)
     text = SECRET_VAL.sub("[redacted]", text)
+    text = QUERY_SECRET.sub(r"\1[redacted]", text)
     if len(text) > 120:
         return text[:117] + "..."
     return text
 
 
+_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_LINE_COMMENT = re.compile(r"//[^\n]*")
+_TRAILING_COMMA = re.compile(r",(\s*[}\]])")
+
+
+def _strip_jsonc(text: str) -> str:
+    text = _BLOCK_COMMENT.sub("", text)
+    text = _LINE_COMMENT.sub("", text)
+    text = _TRAILING_COMMA.sub(r"\1", text)
+    return text
+
+
 def load_json(path: Path) -> object | None:
     try:
-        return json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, json.JSONDecodeError):
+        raw = path.read_text(encoding="utf-8-sig")
+    except OSError:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    try:
+        return json.loads(_strip_jsonc(raw))
+    except json.JSONDecodeError:
         return None
 
 
@@ -59,6 +94,81 @@ def locale_message(ext_version: Path, key: str, default_locale: str | None) -> s
             if isinstance(entry, dict) and entry.get("message"):
                 return str(entry["message"])
     return None
+
+
+def claude_config_paths(home: Path) -> list[Path]:
+    paths: list[Path] = []
+    if sys.platform == "win32":
+        paths.append(home / "AppData" / "Roaming" / "Claude" / "claude_desktop_config.json")
+    elif sys.platform == "darwin":
+        paths.append(
+            home
+            / "Library"
+            / "Application Support"
+            / "Claude"
+            / "claude_desktop_config.json"
+        )
+    else:
+        paths.append(home / ".config" / "Claude" / "claude_desktop_config.json")
+    return paths
+
+
+def chrome_extension_roots(home: Path) -> list[Path]:
+    roots: list[Path] = []
+    if sys.platform == "win32":
+        roots.append(
+            home
+            / "AppData"
+            / "Local"
+            / "Google"
+            / "Chrome"
+            / "User Data"
+            / "Default"
+            / "Extensions"
+        )
+    elif sys.platform == "darwin":
+        roots.append(
+            home
+            / "Library"
+            / "Application Support"
+            / "Google"
+            / "Chrome"
+            / "Default"
+            / "Extensions"
+        )
+    else:
+        for browser_dir in ("google-chrome", "chromium"):
+            roots.append(
+                home / ".config" / browser_dir / "Default" / "Extensions"
+            )
+    return roots
+
+
+def edge_extension_roots(home: Path) -> list[Path]:
+    roots: list[Path] = []
+    if sys.platform == "win32":
+        roots.append(
+            home
+            / "AppData"
+            / "Local"
+            / "Microsoft"
+            / "Edge"
+            / "User Data"
+            / "Default"
+            / "Extensions"
+        )
+    elif sys.platform == "darwin":
+        roots.append(
+            home
+            / "Library"
+            / "Application Support"
+            / "Microsoft Edge"
+            / "Default"
+            / "Extensions"
+        )
+    else:
+        roots.append(home / ".config" / "microsoft-edge" / "Default" / "Extensions")
+    return roots
 
 
 def scan_cursor_mcp(home: Path) -> list[dict[str, str]]:
@@ -109,25 +219,25 @@ def scan_cursor_mcp(home: Path) -> list[dict[str, str]]:
 
 
 def scan_claude(home: Path) -> list[dict[str, str]]:
-    path = home / "AppData" / "Roaming" / "Claude" / "claude_desktop_config.json"
-    data = load_json(path)
-    if not isinstance(data, dict):
-        return []
-    servers = data.get("mcpServers") or {}
-    rows = []
-    if isinstance(servers, dict):
-        for name, spec in servers.items():
-            spec = spec if isinstance(spec, dict) else {}
-            kind = spec.get("url") or spec.get("command") or "claude mcp"
-            rows.append(
-                {
-                    "source": str(path),
-                    "name": str(name),
-                    "can": redact(kind),
-                    "env_keys": "—",
-                    "rank": rank_mcp(str(name), str(kind)),
-                }
-            )
+    rows: list[dict[str, str]] = []
+    for path in claude_config_paths(home):
+        data = load_json(path)
+        if not isinstance(data, dict):
+            continue
+        servers = data.get("mcpServers") or {}
+        if isinstance(servers, dict):
+            for name, spec in servers.items():
+                spec = spec if isinstance(spec, dict) else {}
+                kind = spec.get("url") or spec.get("command") or "claude mcp"
+                rows.append(
+                    {
+                        "source": str(path),
+                        "name": str(name),
+                        "can": redact(kind),
+                        "env_keys": "—",
+                        "rank": rank_mcp(str(name), str(kind)),
+                    }
+                )
     return rows
 
 
@@ -222,6 +332,17 @@ def render(rows: list[dict[str, str]]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def collect_rows(home: Path) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    rows.extend(scan_cursor_mcp(home))
+    rows.extend(scan_claude(home))
+    for root in chrome_extension_roots(home):
+        rows.extend(scan_extensions(root, "Chrome"))
+    for root in edge_extension_roots(home):
+        rows.extend(scan_extensions(root, "Edge"))
+    return rows
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="List local MCP servers and extensions that can act as you."
@@ -233,32 +354,7 @@ def main() -> int:
     )
     args = parser.parse_args()
     home = Path.home()
-    rows: list[dict[str, str]] = []
-    rows.extend(scan_cursor_mcp(home))
-    rows.extend(scan_claude(home))
-    chrome = (
-        home
-        / "AppData"
-        / "Local"
-        / "Google"
-        / "Chrome"
-        / "User Data"
-        / "Default"
-        / "Extensions"
-    )
-    edge = (
-        home
-        / "AppData"
-        / "Local"
-        / "Microsoft"
-        / "Edge"
-        / "User Data"
-        / "Default"
-        / "Extensions"
-    )
-    rows.extend(scan_extensions(chrome, "Chrome"))
-    rows.extend(scan_extensions(edge, "Edge"))
-    report = render(rows)
+    report = render(collect_rows(home))
     sys.stdout.write(report)
     if args.out:
         args.out.write_text(report, encoding="utf-8")
